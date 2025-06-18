@@ -5,6 +5,9 @@ from torch import nn
 import torch.nn.functional as F
 import random
 import glob
+from tqdm import tqdm
+import pickle
+import os
 
 class CharTokenizer:
     def __init__(self):
@@ -79,20 +82,38 @@ class RandomOrderDataIterator:
 # This both creates the tokenizer and uses it to tokenize the data.
 # In a real system you'd like to split it to two separate functions.
 # Feel free to separate it to two functions also in this code.
-def load_data(path: str) -> [CharTokenizer, list[list[int]]]:
-    tokenizer = CharTokenizer()
-    for fname in glob.glob(f"{path}/*.txt"):
-        with open(fname) as fh:
-            text = fh.read()
-            tokenizer.train(text)
-
-    data: list[list[int]] = []
-    for fname in glob.glob(f"{path}/*.txt"):
-        with open(fname) as fh:
-            text = fh.read()
-            data.append(tokenizer.tokenize(text))
-
-    return (tokenizer, data)
+def load_data(path: str):
+    """
+    Loads tokenized data and tokenizer from disk if available, otherwise processes and saves them.
+    Returns: (tokenizer, data)
+    """
+    tokenized_path = os.path.join(path, 'tokenized_data.pkl')
+    tokenizer_path = os.path.join(path, 'tokenizer.json')
+    if os.path.exists(tokenized_path) and os.path.exists(tokenizer_path):
+        print(f"Loading tokenized data from {tokenized_path} and tokenizer from {tokenizer_path}...")
+        with open(tokenized_path, 'rb') as f:
+            data = pickle.load(f)
+        tokenizer = CharTokenizer.load(tokenizer_path)
+        print("Tokenized data loaded.")
+        return tokenizer, data
+    else:
+        print("Tokenized data not found. Training tokenizer and tokenizing data with tqdm progress bars...")
+        tokenizer = CharTokenizer()
+        files = list(glob.glob(f"{path}/*.txt"))
+        for fname in tqdm(files, desc="Training tokenizer"):
+            with open(fname) as fh:
+                text = fh.read()
+                tokenizer.train(text)
+        data = []
+        for fname in tqdm(files, desc="Tokenizing data"):
+            with open(fname) as fh:
+                text = fh.read()
+                data.append(tokenizer.tokenize(text))
+        with open(tokenized_path, 'wb') as f:
+            pickle.dump(data, f)
+        tokenizer.save(tokenizer_path)
+        print(f"Tokenized data and tokenizer saved to {tokenized_path} and {tokenizer_path}.")
+        return tokenizer, data
 
 def batch_items(data_iter: Iterator[list[int]], batch_size: int = 2) -> Iterator[torch.LongTensor]:
     batch = []

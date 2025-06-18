@@ -35,7 +35,7 @@ def create_causal_mask(embed_dim, n_heads, max_context_len):
     mask = mask.unsqueeze(0)  # (1, max_context_len, max_context_len)
     return mask
 
-def self_attention(v, A, mask = None):
+def self_attention(v, A, mask = None, softmax_dropout = None):
     # A: (B, N, N), v: (B, N, D)
     if mask is not None:
         # mask: (1, max_context_len, max_context_len)
@@ -45,18 +45,20 @@ def self_attention(v, A, mask = None):
         # Set masked positions to -inf
         A = A.masked_fill(~mask_slice, float('-inf'))
     attn_weights = F.softmax(A, dim=-1)  # (B, N, N)
+    if softmax_dropout is not None:
+        attn_weights = softmax_dropout(attn_weights)
     # Weighted sum of value vectors
     sa = torch.bmm(attn_weights, v)  # (B, N, D)
     return sa
 
 
-def self_attention_layer(x, kqv_matrix, attention_mask):
+def self_attention_layer(x, kqv_matrix, attention_mask, softmax_dropout = None):
     k, q, v = kqv(x, kqv_matrix)
     att = attention_scores(k, q)
-    sa = self_attention(v, att, attention_mask)
+    sa = self_attention(v, att, attention_mask, softmax_dropout)
     return sa
 
-def multi_head_attention_layer(x, kqv_matrices, mask):
+def multi_head_attention_layer(x, kqv_matrices, mask, softmax_dropout = None):
     # x: (B, N, D), kqv_matrices: list of nn.Linear, mask: (1, max_context_len, max_context_len)
     B, N, D = x.size()
     n_heads = len(kqv_matrices)
@@ -67,7 +69,7 @@ def multi_head_attention_layer(x, kqv_matrices, mask):
         assert kqv_matrix.out_features == 3 * D_head, f"Each kqv_matrix must output 3*D_head={3*D_head}, got {kqv_matrix.out_features}"
     head_outputs = []
     for kqv_matrix in kqv_matrices:
-        head_out = self_attention_layer(x, kqv_matrix, mask)  # (B, N, D_head)
+        head_out = self_attention_layer(x, kqv_matrix, mask, softmax_dropout)  # (B, N, D_head)
         head_outputs.append(head_out)
     # Concatenate along the last dimension
     sa = torch.cat(head_outputs, dim=-1)  # (B, N, D)
@@ -76,7 +78,7 @@ def multi_head_attention_layer(x, kqv_matrices, mask):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, embed_dim, n_heads, max_context_len):
+    def __init__(self, embed_dim, n_heads, max_context_len, dropout=0.0):
         super().__init__()
         assert embed_dim % n_heads == 0
         D_head = embed_dim // n_heads
@@ -87,8 +89,11 @@ class CausalSelfAttention(nn.Module):
         self.n_heads = n_heads
         self.embed_dim = embed_dim
         self.proj = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.softmax_dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        sa = multi_head_attention_layer(x, self.kqv_matrices, self.mask)
+        sa = multi_head_attention_layer(x, self.kqv_matrices, self.mask, self.softmax_dropout)
         sa = self.proj(sa)
+        sa = self.dropout(sa)
         return sa
