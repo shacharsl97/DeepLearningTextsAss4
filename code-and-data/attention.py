@@ -35,7 +35,7 @@ def create_causal_mask(embed_dim, n_heads, max_context_len):
     mask = mask.unsqueeze(0)  # (1, max_context_len, max_context_len)
     return mask
 
-def self_attention(v, A, mask = None, softmax_dropout = None):
+def self_attention(v, A, mask = None, softmax_dropout = None, return_attention_weights=False):
     # A: (B, N, N), v: (B, N, D)
     if mask is not None:
         # mask: (1, max_context_len, max_context_len)
@@ -49,16 +49,22 @@ def self_attention(v, A, mask = None, softmax_dropout = None):
         attn_weights = softmax_dropout(attn_weights)
     # Weighted sum of value vectors
     sa = torch.bmm(attn_weights, v)  # (B, N, D)
+    
+    if return_attention_weights:
+        return sa, attn_weights
     return sa
 
 
-def self_attention_layer(x, kqv_matrix, attention_mask, softmax_dropout = None):
+def self_attention_layer(x, kqv_matrix, attention_mask, softmax_dropout = None, return_attention_weights=False):
     k, q, v = kqv(x, kqv_matrix)
     att = attention_scores(k, q)
+    if return_attention_weights:
+        sa, attn_weights = self_attention(v, att, attention_mask, softmax_dropout, return_attention_weights=True)
+        return sa, attn_weights
     sa = self_attention(v, att, attention_mask, softmax_dropout)
     return sa
 
-def multi_head_attention_layer(x, kqv_matrices, mask, softmax_dropout = None):
+def multi_head_attention_layer(x, kqv_matrices, mask, softmax_dropout = None, return_attention_weights=False):
     # x: (B, N, D), kqv_matrices: list of nn.Linear, mask: (1, max_context_len, max_context_len)
     B, N, D = x.size()
     n_heads = len(kqv_matrices)
@@ -68,12 +74,25 @@ def multi_head_attention_layer(x, kqv_matrices, mask, softmax_dropout = None):
         assert kqv_matrix.in_features == D, f"Each kqv_matrix must take input D={D}, got {kqv_matrix.in_features}"
         assert kqv_matrix.out_features == 3 * D_head, f"Each kqv_matrix must output 3*D_head={3*D_head}, got {kqv_matrix.out_features}"
     head_outputs = []
+    attention_weights = []
+    
     for kqv_matrix in kqv_matrices:
-        head_out = self_attention_layer(x, kqv_matrix, mask, softmax_dropout)  # (B, N, D_head)
-        head_outputs.append(head_out)
+        if return_attention_weights:
+            head_out, attn_weights = self_attention_layer(x, kqv_matrix, mask, softmax_dropout, return_attention_weights=True)
+            head_outputs.append(head_out)
+            attention_weights.append(attn_weights)
+        else:
+            head_out = self_attention_layer(x, kqv_matrix, mask, softmax_dropout)
+            head_outputs.append(head_out)
+    
     # Concatenate along the last dimension
     sa = torch.cat(head_outputs, dim=-1)  # (B, N, D)
     assert sa.size() == x.size(), f"\nSA:\n{sa.size()}\nX:\n{x.size()}"
+    
+    if return_attention_weights:
+        # Stack attention weights: (n_heads, B, N, N)
+        attention_weights = torch.stack(attention_weights, dim=0)
+        return sa, attention_weights
     return sa
 
 
@@ -92,8 +111,14 @@ class CausalSelfAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.softmax_dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
-        sa = multi_head_attention_layer(x, self.kqv_matrices, self.mask, self.softmax_dropout)
-        sa = self.proj(sa)
-        sa = self.dropout(sa)
-        return sa
+    def forward(self, x, return_attention_weights=False):
+        if return_attention_weights:
+            sa, attention_weights = multi_head_attention_layer(x, self.kqv_matrices, self.mask, self.softmax_dropout, return_attention_weights=True)
+            sa = self.proj(sa)
+            sa = self.dropout(sa)
+            return sa, attention_weights
+        else:
+            sa = multi_head_attention_layer(x, self.kqv_matrices, self.mask, self.softmax_dropout)
+            sa = self.proj(sa)
+            sa = self.dropout(sa)
+            return sa
