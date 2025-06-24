@@ -6,6 +6,11 @@ from typing import List, Dict, Tuple, Optional
 import json
 from collections import defaultdict
 import re
+import os
+import data
+from data import CharTokenizer
+import lm
+from transformer import TransformerLM
 
 class AttentionAnalyzer:
     """
@@ -27,38 +32,37 @@ class AttentionAnalyzer:
         
         # Hebrew character sets
         self.hebrew_vowels = set('אעיהו')
-        self.hebrew_consonants = set('בגדהוזחטסעפצקרשת')
+        self.hebrew_consonants = set('בגדהוזסעפצקרשת')
         
-    def extract_attention_matrices(self, input_text: str) -> Dict:
+    def extract_attention_matrices(self, input_text: str) -> Optional[Dict]:
         """
         Extract attention matrices for all layers and heads for given input text.
-        
-        Returns:
-            Dict containing:
-            - 'attention_weights': (n_layers, n_heads, seq_len, seq_len)
-            - 'input_tokens': List of character tokens
-            - 'input_text': Original input text
+        Returns None if the input text is too short.
         """
         # Tokenize input
-        tokens = self.tokenizer.encode(input_text)
+        tokens = self.tokenizer.tokenize(input_text)
+        if len(tokens) <= 1:
+            return None # Not enough context to analyze attention
+        
         input_tensor = torch.tensor([tokens], dtype=torch.long, device=self.device)
         
         # Get attention weights
         with torch.no_grad():
             _, attention_weights = self.model(input_tensor, return_attention_weights=True)
         
-        # Convert to numpy for analysis
-        attention_weights = attention_weights.cpu().numpy()
+        # Convert to numpy for analysis and remove batch dimension
+        # attention_weights shape: (n_layers, n_heads, B, N, N) -> (n_layers, n_heads, N, N)
+        attention_weights = attention_weights.squeeze(2).cpu().numpy()
         
         return {
             'attention_weights': attention_weights,
             'input_tokens': tokens,
             'input_text': input_text,
-            'characters': [self.tokenizer.decode([t]) for t in tokens]
+            'characters': [self.tokenizer.vocab[t] for t in tokens]
         }
     
     def visualize_attention_heatmap(self, attention_data: Dict, layer: int, head: int, 
-                                   save_path: Optional[str] = None, figsize: Tuple = (10, 8)):
+                                   save_path: Optional[str] = None, figsize: Tuple = (12, 10), title_suffix: str = ""):
         """
         Create a heatmap visualization for a specific layer and head.
         """
@@ -72,427 +76,425 @@ class AttentionAnalyzer:
                    cmap='Blues',
                    cbar_kws={'label': 'Attention Weight'})
         
-        plt.title(f'Attention Heatmap - Layer {layer}, Head {head}\nInput: "{attention_data["input_text"]}"')
-        plt.xlabel('Key Position')
-        plt.ylabel('Query Position')
-        plt.xticks(rotation=45)
+        title = f'Attention Heatmap - Layer {layer}, Head {head}\nInput: "{attention_data["input_text"]}"'
+        if title_suffix:
+            title = f'{title_suffix}\n{title}'
+
+        plt.title(title)
+        plt.xlabel('Key Position (Token being attended to)')
+        plt.ylabel('Query Position (Token doing the attending)')
+        plt.xticks(rotation=45, ha="right")
         plt.yticks(rotation=0)
         
         if save_path:
             plt.savefig(save_path, bbox_inches='tight', dpi=300)
-        plt.show()
-    
-    def visualize_multi_head_attention(self, attention_data: Dict, layer: int, 
-                                      save_path: Optional[str] = None):
+            print(f"Saved heatmap to {save_path}")
+        plt.close() # Close figure to free memory
+
+    def detect_previous_token_attention(self, attention_data: Dict) -> List[Dict]:
         """
-        Visualize all heads in a specific layer.
-        """
-        n_heads = attention_data['attention_weights'].shape[1]
-        fig, axes = plt.subplots(2, (n_heads + 1) // 2, figsize=(15, 8))
-        axes = axes.flatten() if n_heads > 1 else [axes]
-        
-        for head in range(n_heads):
-            attention_matrix = attention_data['attention_weights'][layer, head]
-            characters = attention_data['characters']
-            
-            sns.heatmap(attention_matrix, 
-                       xticklabels=characters, 
-                       yticklabels=characters,
-                       cmap='Blues',
-                       ax=axes[head],
-                       cbar=False)
-            axes[head].set_title(f'Head {head}')
-            axes[head].set_xlabel('Key')
-            axes[head].set_ylabel('Query')
-        
-        # Hide unused subplots
-        for i in range(n_heads, len(axes)):
-            axes[i].set_visible(False)
-        
-        plt.suptitle(f'All Attention Heads - Layer {layer}\nInput: "{attention_data["input_text"]}"')
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, bbox_inches='tight', dpi=300)
-        plt.show()
-    
-    def detect_previous_token_attention(self, attention_data: Dict, threshold: float = 0.5) -> Dict:
-        """
-        Detect heads that consistently attend to the previous token.
+        Calculates the 'previous token' attention score for all heads.
         """
         n_layers, n_heads, seq_len, _ = attention_data['attention_weights'].shape
-        results = {}
+        results = []
         
         for layer in range(n_layers):
             for head in range(n_heads):
                 attention_matrix = attention_data['attention_weights'][layer, head]
                 
-                # Check diagonal-1 (previous token attention)
-                prev_token_attention = []
-                for i in range(1, seq_len):
-                    prev_token_attention.append(attention_matrix[i, i-1])
+                prev_token_attention = [attention_matrix[i, i-1] for i in range(1, seq_len)]
                 
-                avg_prev_attention = np.mean(prev_token_attention)
-                max_prev_attention = np.max(prev_token_attention)
-                
-                if avg_prev_attention > threshold:
-                    results[f'layer_{layer}_head_{head}'] = {
-                        'avg_prev_attention': avg_prev_attention,
-                        'max_prev_attention': max_prev_attention,
-                        'pattern_strength': avg_prev_attention,
-                        'pattern_type': 'previous_token'
-                    }
-        
+                if prev_token_attention:
+                    avg_prev_attention = np.mean(prev_token_attention)
+                    results.append({
+                        'layer': layer, 'head': head,
+                        'pattern_type': 'previous_token',
+                        'score': avg_prev_attention
+                    })
         return results
     
-    def detect_space_attention(self, attention_data: Dict, threshold: float = 0.3) -> Dict:
+    def detect_space_attention(self, attention_data: Dict) -> List[Dict]:
         """
-        Detect heads that attend to space characters.
+        Calculates the 'space detection' score for all heads.
+        This pattern means non-space tokens are attending to space tokens.
         """
         n_layers, n_heads, seq_len, _ = attention_data['attention_weights'].shape
         characters = attention_data['characters']
-        results = {}
+        results = []
         
-        # Find space positions
-        space_positions = [i for i, char in enumerate(characters) if char == ' ']
-        
+        space_positions = [i for i, char in enumerate(characters) if char in self.spaces]
         if not space_positions:
-            return results
+            return []
         
         for layer in range(n_layers):
             for head in range(n_heads):
                 attention_matrix = attention_data['attention_weights'][layer, head]
                 
-                # Calculate average attention to spaces
-                space_attention_scores = []
-                for pos in range(seq_len):
-                    if pos not in space_positions:  # Don't count spaces attending to themselves
-                        attention_to_spaces = [attention_matrix[pos, space_pos] for space_pos in space_positions]
-                        if attention_to_spaces:
-                            space_attention_scores.append(np.mean(attention_to_spaces))
+                # Avg attention from non-space tokens to space tokens
+                attention_to_spaces = attention_matrix[:, space_positions]
                 
-                if space_attention_scores:
-                    avg_space_attention = np.mean(space_attention_scores)
-                    if avg_space_attention > threshold:
-                        results[f'layer_{layer}_head_{head}'] = {
-                            'avg_space_attention': avg_space_attention,
-                            'pattern_strength': avg_space_attention,
-                            'pattern_type': 'space_detection'
-                        }
-        
+                # Create a mask to exclude rows that are spaces themselves
+                non_space_rows_mask = [i for i, char in enumerate(characters) if char not in self.spaces]
+
+                if not non_space_rows_mask:
+                    continue # Only spaces in this text
+
+                # Calculate score
+                score = attention_to_spaces[non_space_rows_mask, :].mean()
+
+                results.append({
+                    'layer': layer, 'head': head,
+                    'pattern_type': 'space_detection',
+                    'score': score
+                })
         return results
-    
-    def detect_vowel_consonant_patterns(self, attention_data: Dict, threshold: float = 0.2) -> Dict:
+
+    def detect_vowel_consonant_patterns(self, attention_data: Dict) -> List[Dict]:
         """
-        Detect heads that show different attention patterns for vowels vs consonants.
+        Calculates a score for vowel-consonant interaction patterns for all heads.
+        A high score indicates a head treats vowels and consonants differently.
         """
         n_layers, n_heads, seq_len, _ = attention_data['attention_weights'].shape
         characters = attention_data['characters']
-        results = {}
-        
-        # Classify characters
-        vowel_positions = []
-        consonant_positions = []
-        
-        for i, char in enumerate(characters):
-            if char in self.vowels or char in self.hebrew_vowels:
-                vowel_positions.append(i)
-            elif char in self.consonants or char in self.hebrew_consonants:
-                consonant_positions.append(i)
-        
+        results = []
+
+        is_hebrew = any(c in self.hebrew_vowels or c in self.hebrew_consonants for c in characters)
+        vowel_set = self.hebrew_vowels if is_hebrew else self.vowels
+        consonant_set = self.hebrew_consonants if is_hebrew else self.consonants
+
+        vowel_indices = [i for i, c in enumerate(characters) if c in vowel_set]
+        consonant_indices = [i for i, c in enumerate(characters) if c in consonant_set]
+
+        if not vowel_indices or not consonant_indices:
+            return []
+
         for layer in range(n_layers):
             for head in range(n_heads):
                 attention_matrix = attention_data['attention_weights'][layer, head]
                 
-                # Calculate attention patterns for vowels and consonants
-                vowel_attention_patterns = []
-                consonant_attention_patterns = []
+                # Consonants attending to Vowels (excluding self-attention)
+                c_to_v_attention = attention_matrix[np.ix_(consonant_indices, vowel_indices)].mean()
                 
-                # Vowels attending to consonants
-                for v_pos in vowel_positions:
-                    for c_pos in consonant_positions:
-                        if v_pos != c_pos:
-                            vowel_attention_patterns.append(attention_matrix[v_pos, c_pos])
+                # Vowels attending to Consonants (excluding self-attention)
+                v_to_c_attention = attention_matrix[np.ix_(vowel_indices, consonant_indices)].mean()
                 
-                # Consonants attending to vowels
-                for c_pos in consonant_positions:
-                    for v_pos in vowel_positions:
-                        if c_pos != v_pos:
-                            consonant_attention_patterns.append(attention_matrix[c_pos, v_pos])
-                
-                if vowel_attention_patterns and consonant_attention_patterns:
-                    avg_vowel_to_consonant = np.mean(vowel_attention_patterns)
-                    avg_consonant_to_vowel = np.mean(consonant_attention_patterns)
-                    
-                    # Check if there's a significant difference
-                    pattern_strength = abs(avg_vowel_to_consonant - avg_consonant_to_vowel)
-                    
-                    if pattern_strength > threshold:
-                        results[f'layer_{layer}_head_{head}'] = {
-                            'vowel_to_consonant': avg_vowel_to_consonant,
-                            'consonant_to_vowel': avg_consonant_to_vowel,
-                            'pattern_strength': pattern_strength,
-                            'pattern_type': 'vowel_consonant'
-                        }
-        
+                # The score is the absolute difference, showing specialization
+                score = abs(c_to_v_attention - v_to_c_attention)
+
+                results.append({
+                    'layer': layer, 'head': head,
+                    'pattern_type': 'vowel_consonant',
+                    'score': score
+                })
         return results
     
-    def detect_positional_patterns(self, attention_data: Dict, max_offset: int = 5, threshold: float = 0.3) -> Dict:
+    def detect_positional_patterns(self, attention_data: Dict, max_offset: int = 5) -> List[Dict]:
         """
-        Detect heads that attend to specific relative positions.
+        Detects attention to specific relative positions (offsets).
         """
         n_layers, n_heads, seq_len, _ = attention_data['attention_weights'].shape
-        results = {}
-        
+        results = []
+
         for layer in range(n_layers):
             for head in range(n_heads):
                 attention_matrix = attention_data['attention_weights'][layer, head]
-                
-                # Check different positional offsets
-                for offset in range(-max_offset, max_offset + 1):
-                    if offset == 0:
-                        continue
-                    
-                    offset_attention_scores = []
-                    for i in range(seq_len):
-                        j = i + offset
-                        if 0 <= j < seq_len:
-                            offset_attention_scores.append(attention_matrix[i, j])
-                    
-                    if offset_attention_scores:
-                        avg_offset_attention = np.mean(offset_attention_scores)
-                        if avg_offset_attention > threshold:
-                            results[f'layer_{layer}_head_{head}_offset_{offset}'] = {
-                                'offset': offset,
-                                'avg_attention': avg_offset_attention,
-                                'pattern_strength': avg_offset_attention,
-                                'pattern_type': f'positional_offset_{offset}'
-                            }
-        
+                for offset in range(1, max_offset + 1):
+                    # Attention to position i-offset from token i
+                    positional_attention = [attention_matrix[i, i-offset] for i in range(offset, seq_len)]
+                    if positional_attention:
+                        score = np.mean(positional_attention)
+                        results.append({
+                            'layer': layer, 'head': head,
+                            'pattern_type': f'positional_offset_-{offset}',
+                            'score': score
+                        })
         return results
-    
-    def analyze_attention_patterns(self, input_texts: List[str]) -> Dict:
+
+    def generate_analysis_report(self, task_champions: Dict, language: str, output_file: str):
         """
-        Comprehensive analysis of attention patterns across multiple inputs.
+        Generates a markdown report summarizing the best heads for each task.
         """
-        all_results = {
-            'previous_token': defaultdict(list),
-            'space_detection': defaultdict(list),
-            'vowel_consonant': defaultdict(list),
-            'positional': defaultdict(list)
-        }
-        
-        for i, text in enumerate(input_texts):
-            print(f"Analyzing text {i+1}/{len(input_texts)}: '{text[:50]}...'")
+        report_content = [f"# Task-Based Attention Analysis Report ({language.capitalize()})\n"]
+        report_content.append("This report identifies the single best attention head for several key linguistic tasks based on average scores across all samples.\n")
+
+        for pattern_type, champion in sorted(task_champions.items()):
+            score = champion['score']
+            layer = champion['layer']
+            head = champion['head']
+            num_samples = len(champion['attention_data_list'])
             
-            attention_data = self.extract_attention_matrices(text)
+            # Find min sequence length for the common positions info
+            min_seq_len = min(attention_data['attention_weights'].shape[-1] for attention_data in champion['attention_data_list'])
+            max_seq_len = max(attention_data['attention_weights'].shape[-1] for attention_data in champion['attention_data_list'])
             
-            # Detect different patterns
-            prev_token_results = self.detect_previous_token_attention(attention_data)
-            space_results = self.detect_space_attention(attention_data)
-            vowel_consonant_results = self.detect_vowel_consonant_patterns(attention_data)
-            positional_results = self.detect_positional_patterns(attention_data)
+            report_content.append(f"## Task: `{pattern_type}`")
+            report_content.append(f"- **Champion Head**: Layer {layer}, Head {head}")
+            report_content.append(f"- **Average Activation Score**: {score:.4f}")
+            report_content.append(f"- **Number of Samples**: {num_samples}")
+            report_content.append(f"- **Sequence Length Range**: {min_seq_len}-{max_seq_len} (averaged over common positions 1-{min_seq_len})")
             
-            # Aggregate results
-            for pattern_type, results in [
-                ('previous_token', prev_token_results),
-                ('space_detection', space_results),
-                ('vowel_consonant', vowel_consonant_results),
-                ('positional', positional_results)
-            ]:
-                for head_key, result in results.items():
-                    all_results[pattern_type][head_key].append(result)
-        
-        # Calculate consistency scores
-        final_results = {}
-        for pattern_type, head_results in all_results.items():
-            for head_key, results in head_results.items():
-                if len(results) >= 2:  # Need at least 2 samples for consistency
-                    avg_strength = np.mean([r['pattern_strength'] for r in results])
-                    consistency = 1.0 - np.std([r['pattern_strength'] for r in results]) / avg_strength
-                    
-                    final_results[f"{pattern_type}_{head_key}"] = {
-                        'pattern_type': pattern_type,
-                        'head_key': head_key,
-                        'avg_strength': avg_strength,
-                        'consistency': consistency,
-                        'num_samples': len(results),
-                        'details': results
-                    }
-        
-        return final_results
-    
-    def find_most_interpretable_heads(self, analysis_results: Dict, min_consistency: float = 0.7) -> List[Dict]:
-        """
-        Find the most interpretable attention heads based on pattern strength and consistency.
-        """
-        interpretable_heads = []
-        
-        for head_key, result in analysis_results.items():
-            if result['consistency'] >= min_consistency and result['avg_strength'] > 0.3:
-                interpretable_heads.append({
-                    'head_key': head_key,
-                    'pattern_type': result['pattern_type'],
-                    'avg_strength': result['avg_strength'],
-                    'consistency': result['consistency'],
-                    'interpretability_score': result['avg_strength'] * result['consistency']
-                })
-        
-        # Sort by interpretability score
-        interpretable_heads.sort(key=lambda x: x['interpretability_score'], reverse=True)
-        return interpretable_heads
-    
-    def generate_analysis_report(self, analysis_results: Dict, interpretable_heads: List[Dict], 
-                                output_file: Optional[str] = None) -> str:
-        """
-        Generate a comprehensive analysis report.
-        """
-        report = []
-        report.append("# Attention Pattern Analysis Report")
-        report.append("=" * 50)
-        report.append("")
-        
-        # Summary statistics
-        report.append("## Summary Statistics")
-        report.append(f"- Total patterns analyzed: {len(analysis_results)}")
-        report.append(f"- Interpretable heads found: {len(interpretable_heads)}")
-        report.append("")
-        
-        # Most interpretable heads
-        report.append("## Most Interpretable Attention Heads")
-        report.append("")
-        
-        for i, head in enumerate(interpretable_heads[:10]):  # Top 10
-            report.append(f"### {i+1}. {head['head_key']}")
-            report.append(f"- **Pattern Type**: {head['pattern_type']}")
-            report.append(f"- **Average Strength**: {head['avg_strength']:.3f}")
-            report.append(f"- **Consistency**: {head['consistency']:.3f}")
-            report.append(f"- **Interpretability Score**: {head['interpretability_score']:.3f}")
-            report.append("")
-        
-        # Pattern type breakdown
-        report.append("## Pattern Type Breakdown")
-        pattern_counts = defaultdict(int)
-        for head in interpretable_heads:
-            pattern_counts[head['pattern_type']] += 1
-        
-        for pattern_type, count in pattern_counts.items():
-            report.append(f"- **{pattern_type}**: {count} heads")
-        report.append("")
-        
-        # Detailed analysis
-        report.append("## Detailed Analysis")
-        for head_key, result in analysis_results.items():
-            if result['consistency'] > 0.5:  # Show moderately consistent patterns
-                report.append(f"### {head_key}")
-                report.append(f"- Pattern Type: {result['pattern_type']}")
-                report.append(f"- Average Strength: {result['avg_strength']:.3f}")
-                report.append(f"- Consistency: {result['consistency']:.3f}")
-                report.append(f"- Samples: {result['num_samples']}")
-                report.append("")
-        
-        report_text = "\n".join(report)
-        
-        if output_file:
-            with open(output_file, 'w') as f:
-                f.write(report_text)
-        
-        return report_text
-    
-    def save_attention_data(self, attention_data: Dict, filename: str):
-        """
-        Save attention data to file for later analysis.
-        """
-        # Convert numpy arrays to lists for JSON serialization
-        data_to_save = {
-            'attention_weights': attention_data['attention_weights'].tolist(),
-            'input_tokens': attention_data['input_tokens'],
-            'input_text': attention_data['input_text'],
-            'characters': attention_data['characters']
-        }
-        
-        with open(filename, 'w') as f:
-            json.dump(data_to_save, f, indent=2)
-    
-    def load_attention_data(self, filename: str) -> Dict:
-        """
-        Load attention data from file.
-        """
-        with open(filename, 'r') as f:
-            data = json.load(f)
-        
-        # Convert lists back to numpy arrays
-        data['attention_weights'] = np.array(data['attention_weights'])
-        return data
+            # Simple thresholding logic
+            thresholds = {
+                'previous_token': 0.5,
+                'space_detection': 0.1,
+                'vowel_consonant': 0.05,
+                'positional_offset_-1': 0.5,
+                'positional_offset_-2': 0.2,
+                'positional_offset_-3': 0.1,
+                'positional_offset_-4': 0.1,
+                'positional_offset_-5': 0.1,
+            }
+            threshold = thresholds.get(pattern_type, 0.05)
+            conclusion = "This head appears to be specialized for this task." if score > threshold else "This head shows weak specialization for this task."
+            report_content.append(f"- **Conclusion**: {conclusion} (Threshold: {threshold})")
+
+            # Link to the generated averaged heatmap
+            avg_heatmap_filename = f"champion_head_{language}_{pattern_type}_averaged.png"
+            report_content.append(f"- **Averaged Heatmap**: ![Averaged Attention Heatmap for {pattern_type}](./{avg_heatmap_filename})")
+            
+            # Link to individual sample heatmaps
+            report_content.append(f"- **Individual Sample Heatmaps**:")
+            for i in range(num_samples):
+                sample_heatmap_filename = f"champion_head_{language}_{pattern_type}_sample_{i+1}.png"
+                report_content.append(f"  - [Sample {i+1}](./{sample_heatmap_filename})")
+            
+            report_content.append("")  # Empty line for spacing
+
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write("\n".join(report_content))
+        print(f"Generated analysis report: {output_file}")
 
 
 def create_sample_texts(hebrew=False):
-    """
-    Create sample texts for analysis.
-    """
     if hebrew:
         return [
-            "שלום עולם",
-            "בוקר טוב לכולם",
-            "אני אוהב ללמוד",
-            "השמש זורחת בבוקר",
-            "הספר נמצא על השולחן"
+            "אבא קורא ספר מעניין מאוד",  # Simple sentence
+            "השועל החום המהיר קופץ מעל הכלב העצלן.", # Hebrew pangram
+            "אני אוהב לאכול גלידה ביום חם.", # Vowel/consonant mix
         ]
-    else:
-        return [
-            "Hello world",
-            "Good morning everyone",
-            "I love learning",
-            "The sun rises in the morning",
-            "The book is on the table",
-            "Attention patterns are fascinating",
-            "Transformers process text efficiently",
-            "Machine learning models learn patterns"
-        ]
+    return [
+        "The quick brown fox jumps over the lazy dog.", # Pangram, good for general purpose
+        "She sells seashells by the seashore.", # Repetitive sounds
+        "To be or not to be, that is the question.", # Structure and punctuation
+        "Peter Piper picked a peck of pickled peppers.", # Alliteration
+        "io ufo aea", # Vowel-heavy
+        "rhythm myths fly by", # Consonant-heavy
+        "A man, a plan, a canal: Panama.", # Palindrome, structure
+        "This is a test sentence with several spaces.", # Specific for space detection
+    ]
+
+def load_trained_model(checkpoint_dir: str, hebrew: bool = False, gpu: int = 0):
+    device = f'cuda:{gpu}' if torch.cuda.is_available() else 'cpu'
+    
+    # Load model properties
+    props_files = [f for f in os.listdir(checkpoint_dir) if f.endswith('_props.json')]
+    if not props_files:
+        raise FileNotFoundError(f"Could not find a properties JSON file in {checkpoint_dir}")
+    props_path = os.path.join(checkpoint_dir, props_files[0])
+    with open(props_path, 'r') as f:
+        props = json.load(f)
+    
+    # Load tokenizer
+    tokenizer_path = os.path.join(checkpoint_dir, 'tokenizer.json')
+    tokenizer = CharTokenizer.load(tokenizer_path)
+    
+    # Init model with correct parameters
+    # Use seq_len as max_context_len, and provide defaults for missing parameters
+    model = TransformerLM(
+        n_layers=props['n_layers'],
+        n_heads=props['n_heads'],
+        embed_size=props['embed_size'],
+        max_context_len=props['seq_len'],  # seq_len is the context length
+        vocab_size=tokenizer.vocab_size(),
+        mlp_hidden_size=props['mlp_hidden_size'],
+        with_residuals=props.get('with_residuals', True),  # Default to False if not present
+        dropout=props.get('dropout', 0.0),  # Default to 0.0 if not present
+        init_method=props.get('init_method', 'xavier')  # Default to xavier if not present
+    ).to(device)
+    
+    # Load weights
+    weights_path = [p for p in os.listdir(checkpoint_dir) if p.endswith('.pt')][0]
+    checkpoint = torch.load(os.path.join(checkpoint_dir, weights_path), map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    return model, tokenizer, device
 
 
-# Example usage functions
-def run_attention_analysis(model, tokenizer, hebrew=False, save_visualizations=True):
+def run_task_based_analysis(model, tokenizer, device, language):
     """
-    Run complete attention analysis pipeline.
+    Runs the full task-based analysis pipeline.
     """
-    analyzer = AttentionAnalyzer(model, tokenizer)
+    print("Starting task-based attention analysis...")
+    analyzer = AttentionAnalyzer(model, tokenizer, device)
+    sample_texts = create_sample_texts(hebrew=(language=='hebrew'))
+
+    # All pattern detection functions to run
+    detection_functions = {
+        "previous_token": analyzer.detect_previous_token_attention,
+        "space_detection": analyzer.detect_space_attention,
+        "vowel_consonant": analyzer.detect_vowel_consonant_patterns,
+    }
     
-    # Get sample texts
-    sample_texts = create_sample_texts(hebrew)
+    # Add positional offset detectors
+    for offset in range(1, 6):
+        pattern_name = f'positional_offset_-{offset}'
+        detection_functions[pattern_name] = lambda data, o=offset: analyzer.detect_positional_patterns(data, max_offset=o)
+
+    # Dictionary to store all scores for each head across all samples
+    all_scores = defaultdict(list)  # pattern_type -> list of (layer, head, score, attention_data)
     
-    # Run analysis
-    print("Running attention pattern analysis...")
-    analysis_results = analyzer.analyze_attention_patterns(sample_texts)
-    
-    # Find interpretable heads
-    interpretable_heads = analyzer.find_most_interpretable_heads(analysis_results)
-    
-    # Generate report
-    report = analyzer.generate_analysis_report(analysis_results, interpretable_heads)
-    print(report)
-    
-    # Save report
-    lang_suffix = "hebrew" if hebrew else "english"
-    with open(f"attention_analysis_report_{lang_suffix}.md", 'w') as f:
-        f.write(report)
-    
-    # Create visualizations for top interpretable heads
-    if save_visualizations and interpretable_heads:
-        top_head = interpretable_heads[0]
-        head_key = top_head['head_key']
-        
-        # Parse layer and head from key
-        if 'layer_' in head_key and 'head_' in head_key:
-            parts = head_key.split('_')
-            layer = int(parts[1])
-            head = int(parts[3])
+    print(f"\nAnalyzing {len(sample_texts)} sample texts...")
+    for i, text in enumerate(sample_texts):
+        print(f"  [{i+1}/{len(sample_texts)}] Analyzing: \"{text}\"")
+        attention_data = analyzer.extract_attention_matrices(text)
+        if not attention_data:
+            continue
+
+        for pattern_type, func in detection_functions.items():
+            # Run detection and get scores for all heads for this text
+            head_scores = func(attention_data)
             
-            # Create visualization for first sample text
-            attention_data = analyzer.extract_attention_matrices(sample_texts[0])
+            for result in head_scores:
+                # For positional patterns, we only care about the specific offset being tested
+                if 'positional_offset' in pattern_type and result['pattern_type'] != pattern_type:
+                    continue
+
+                all_scores[pattern_type].append({
+                    'layer': result['layer'],
+                    'head': result['head'],
+                    'score': result['score'],
+                    'attention_data': attention_data
+                })
+
+    # Calculate average scores and find champions
+    task_champions = {}
+    print("\nCalculating average scores and finding champions...")
+    
+    for pattern_type, scores in all_scores.items():
+        # Group scores by layer and head
+        head_averages = defaultdict(list)
+        for score_data in scores:
+            key = (score_data['layer'], score_data['head'])
+            head_averages[key].append(score_data['score'])
+        
+        # Calculate average for each head
+        best_avg_score = -1
+        best_head = None
+        best_attention_data_list = []
+        
+        for (layer, head), score_list in head_averages.items():
+            avg_score = np.mean(score_list)
+            if avg_score > best_avg_score:
+                best_avg_score = avg_score
+                best_head = (layer, head)
+                # Collect all attention data for this head
+                best_attention_data_list = [s['attention_data'] for s in scores 
+                                          if s['layer'] == layer and s['head'] == head]
+        
+        if best_head:
+            task_champions[pattern_type] = {
+                'layer': best_head[0],
+                'head': best_head[1],
+                'score': best_avg_score,
+                'pattern_type': pattern_type,
+                'attention_data_list': best_attention_data_list
+            }
+
+    print("\nAnalysis complete. Found champions for the following tasks:")
+    for pattern_type, champ in task_champions.items():
+        print(f"  - {pattern_type}: Layer {champ['layer']}, Head {champ['head']} (Avg Score: {champ['score']:.4f})")
+
+    print("\nGenerating heatmaps for champion heads...")
+    for pattern_type, champ in task_champions.items():
+        layer, head = champ['layer'], champ['head']
+        attention_data_list = champ['attention_data_list']
+        
+        # Generate individual heatmaps for each sample
+        for i, attention_data in enumerate(attention_data_list):
+            sample_heatmap_filename = f"champion_head_{language}_{pattern_type}_sample_{i+1}.png"
             analyzer.visualize_attention_heatmap(
-                attention_data, layer, head, 
-                save_path=f"attention_heatmap_{lang_suffix}_layer{layer}_head{head}.png"
+                attention_data=attention_data,
+                layer=layer,
+                head=head,
+                save_path=os.path.join('search_results', sample_heatmap_filename),
+                title_suffix=f"Champion Head for {pattern_type.replace('_', ' ').title()} - Sample {i+1}"
+            )
+        
+        # Generate averaged heatmap
+        if attention_data_list:
+            # Find the minimum sequence length across all samples
+            min_seq_len = min(attention_data['attention_weights'].shape[-1] for attention_data in attention_data_list)
+            
+            # Average only the common positions (up to min_seq_len)
+            avg_attention_matrix = np.zeros((attention_data_list[0]['attention_weights'].shape[0],  # n_layers
+                                           attention_data_list[0]['attention_weights'].shape[1],   # n_heads
+                                           min_seq_len, min_seq_len))
+            
+            for attention_data in attention_data_list:
+                # Take only the first min_seq_len positions
+                truncated_attention = attention_data['attention_weights'][:, :, :min_seq_len, :min_seq_len]
+                avg_attention_matrix += truncated_attention
+            
+            avg_attention_matrix /= len(attention_data_list)
+            
+            # Create averaged attention data using the shortest sample's tokens/characters (truncated)
+            shortest_sample = min(attention_data_list, key=lambda x: len(x['characters']))
+            avg_attention_data = {
+                'attention_weights': avg_attention_matrix,
+                'input_tokens': shortest_sample['input_tokens'][:min_seq_len],
+                'input_text': f"Average across {len(attention_data_list)} samples (common positions 1-{min_seq_len})",
+                'characters': shortest_sample['characters'][:min_seq_len]
+            }
+            
+            avg_heatmap_filename = f"champion_head_{language}_{pattern_type}_averaged.png"
+            analyzer.visualize_attention_heatmap(
+                attention_data=avg_attention_data,
+                layer=layer,
+                head=head,
+                save_path=os.path.join('search_results', avg_heatmap_filename),
+                title_suffix=f"Champion Head for {pattern_type.replace('_', ' ').title()} - Averaged (Common Positions)"
             )
     
-    return analysis_results, interpretable_heads 
+    # Generate the final report
+    report_path = f"task_based_attention_report_{language}.md"
+    analyzer.generate_analysis_report(task_champions, language, os.path.join('search_results', report_path))
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description="Run task-based attention analysis on a transformer model.")
+    parser.add_argument('language', type=str, choices=['english', 'hebrew'], help="Language of the model to analyze.")
+    parser.add_argument('--checkpoint_dir', type=str, default=None, help="Path to a specific checkpoint directory. If not provided, the latest will be used.")
+    args = parser.parse_args()
+
+    if args.checkpoint_dir:
+        final_checkpoint_dir = args.checkpoint_dir
+    else:
+        # Find the latest checkpoint for the chosen language
+        checkpoint_base_dir = 'checkpoints'
+        dirs = [d for d in os.listdir(checkpoint_base_dir) if d.startswith(f'{args.language}_step_')]
+        if not dirs:
+            raise FileNotFoundError(f"No checkpoint directories found for language '{args.language}' in '{checkpoint_base_dir}'")
+
+        latest_step = -1
+        latest_dir = ''
+        for d in dirs:
+            try:
+                step = int(d.split('_')[-1])
+                if step > latest_step:
+                    latest_step = step
+                    latest_dir = d
+            except (ValueError, IndexError):
+                continue
+        
+        final_checkpoint_dir = os.path.join(checkpoint_base_dir, latest_dir)
+
+    print(f"Using checkpoint: {final_checkpoint_dir}")
+    model, tokenizer, device = load_trained_model(final_checkpoint_dir, hebrew=(args.language=='hebrew'))
+    
+    # Make sure search_results directory exists
+    if not os.path.exists('search_results'):
+        os.makedirs('search_results')
+        
+    run_task_based_analysis(model, tokenizer, device, args.language)
+    print("\nDone.") 

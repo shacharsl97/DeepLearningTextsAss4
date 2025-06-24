@@ -27,7 +27,7 @@ if __name__ == '__main__':
     parser.add_argument('--embed_size', type=int, default=192, help='Embedding size')
     parser.add_argument('--mlp_hidden_size', type=int, default=None, help='MLP hidden size (default: 4*embed_size)')
     parser.add_argument('--learning_rate', type=float, default=5e-4, help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay for optimizer')
+    parser.add_argument('--weight_decay', type=float, default=0.05, help='Weight decay for optimizer')
     parser.add_argument('--search_run', action='store_true', help='If set, disables checkpoints and only samples at end (for run_search)')
     parser.add_argument('--num_batches_to_train', type=int, default=50000, help='Number of batches to train (default: 50000)')
     parser.add_argument('--temperature', type=float, default=1.0, help='Temperature for sampling (default: 1.0)')
