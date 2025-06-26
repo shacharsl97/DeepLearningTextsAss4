@@ -14,25 +14,35 @@ class TransformerDecoderBlock(nn.Module):
         self.with_residuals = with_residuals
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, inputs):
+    def forward(self, inputs, return_attention_weights=False):
         if self.with_residuals:
             res = inputs
             x = self.layer_norm_1(res)
-            x = self.causal_attention(x)
+            if return_attention_weights:
+                x, attn_weights = self.causal_attention(x, return_attention_weights=True)
+            else:
+                x = self.causal_attention(x)
             x = self.dropout(x)
             x = x + res
             res = x
             x = self.layer_norm_2(res)
             x = self.mlp(x)
             x = x + res
+            if return_attention_weights:
+                return x, attn_weights
             return x
         else:
             x = inputs
             x = self.layer_norm_1(x)
-            x = self.causal_attention(x)
+            if return_attention_weights:
+                x, attn_weights = self.causal_attention(x, return_attention_weights=True)
+            else:
+                x = self.causal_attention(x)
             x = self.dropout(x)  # Dropout after self-attention
             x = self.layer_norm_2(x)
             x = self.mlp(x)
+            if return_attention_weights:
+                return x, attn_weights
             return x
 
 class Embed(nn.Module):
@@ -76,17 +86,31 @@ class TransformerLM(nn.Module):
         self.layer_norm = nn.LayerNorm(embed_size)
         self.word_prediction = nn.Linear(embed_size, vocab_size)
         self.max_context_len = max_context_len
+        self.n_layers = n_layers
+        self.n_heads = n_heads
         self.init_weights(init_method)
 
         n_params = sum(p.numel() for p in self.parameters())
         print("Parameter count: %.2fM" % (n_params/1e6,))
 
-    def forward(self, inputs):
+    def forward(self, inputs, return_attention_weights=False):
         x = self.embed(inputs)
+        all_attention_weights = []
+        
         for layer in self.layers:
-            x = layer(x)
+            if return_attention_weights:
+                x, attn_weights = layer(x, return_attention_weights=True)
+                all_attention_weights.append(attn_weights)
+            else:
+                x = layer(x)
+        
         x = self.layer_norm(x)
         logits = self.word_prediction(x)
+        
+        if return_attention_weights:
+            # Stack all attention weights: (n_layers, n_heads, B, N, N)
+            all_attention_weights = torch.stack(all_attention_weights, dim=0)
+            return logits, all_attention_weights
         return logits
 
     def init_weights(self, method='xavier'):
@@ -130,9 +154,41 @@ class TransformerLM(nn.Module):
         return generated
 
     def better_sample_continuation(self, prefix: list[int], max_tokens_to_generate: int, temperature: float, topK: int) -> list[int]:
-        raise Exception("Not implemented")
-        # TODO implement this.
-        # Temperature should be the temperature in which you sample.
-        # TopK indicates that we don't sample from the entire distribution, but only from the top k scoring tokens
-        # for the given position.
+        feed_to_lm = prefix[:]
+        generated = []
+        device = next(self.parameters()).device  # Ensure input is on the same device as the model
+        
+        with torch.no_grad():
+            while len(generated) < max_tokens_to_generate:
+                if len(feed_to_lm) > self.max_context_len:
+                    # if we have more tokens than context length, trim it to context length.
+                    feed_to_lm = feed_to_lm[-self.max_context_len:]
+                
+                logits = self(torch.tensor([feed_to_lm], dtype=torch.int32, device=device))
+                logits_for_last_token = logits[0][-1]
+                
+                # Apply temperature scaling
+                logits_scaled = logits_for_last_token / temperature
+                
+                # Apply top-k filtering
+                if topK > 0:
+                    # Get the top-k values and their indices
+                    top_k_values, top_k_indices = torch.topk(logits_scaled, min(topK, logits_scaled.size(-1)))
+                    
+                    # Create a new tensor with -inf for non-top-k positions
+                    filtered_logits = torch.full_like(logits_scaled, float('-inf'))
+                    filtered_logits[top_k_indices] = top_k_values
+                    
+                    # Apply softmax to get probabilities
+                    distribution_for_last_token = F.softmax(filtered_logits, dim=-1)
+                else:
+                    # No top-k filtering, just apply temperature
+                    distribution_for_last_token = F.softmax(logits_scaled, dim=-1)
+                
+                # Sample from the distribution
+                sampled_token = torch.multinomial(distribution_for_last_token, num_samples=1)
+                generated.append(sampled_token.item())
+                feed_to_lm.append(sampled_token.item())
+        
+        return generated
 

@@ -27,9 +27,11 @@ if __name__ == '__main__':
     parser.add_argument('--embed_size', type=int, default=192, help='Embedding size')
     parser.add_argument('--mlp_hidden_size', type=int, default=None, help='MLP hidden size (default: 4*embed_size)')
     parser.add_argument('--learning_rate', type=float, default=5e-4, help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay for optimizer')
+    parser.add_argument('--weight_decay', type=float, default=0.05, help='Weight decay for optimizer')
     parser.add_argument('--search_run', action='store_true', help='If set, disables checkpoints and only samples at end (for run_search)')
     parser.add_argument('--num_batches_to_train', type=int, default=50000, help='Number of batches to train (default: 50000)')
+    parser.add_argument('--temperature', type=float, default=1.0, help='Temperature for sampling (default: 1.0)')
+    parser.add_argument('--topK', type=int, default=5, help='Top-K sampling parameter (default: 5)')
     args = parser.parse_args()
 
     DEVICE = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
@@ -85,7 +87,7 @@ if __name__ == '__main__':
         for i in range(10):
             prompt = "JULIET:"
             input_ids = tokenizer.tokenize(prompt)
-            generated = model.sample_continuation(input_ids, 500)
+            generated = model.better_sample_continuation(input_ids, 500, args.temperature, args.topK)
             detok = tokenizer.detokenize(generated)
             print(f"Generation {i+1}: ", end="")
             if args.hebrew:
@@ -126,7 +128,7 @@ if __name__ == '__main__':
                     if num_batches % 500 == 0:
                         for _ in range(1):
                             model.eval()
-                            sampled = tokenizer.detokenize(model.sample_continuation(tokenizer.tokenize(START_TOKEN), 500))
+                            sampled = tokenizer.detokenize(model.better_sample_continuation(tokenizer.tokenize(START_TOKEN), 500, args.temperature, args.topK))
                             model.train()
                             print("Model sample: ", end="")
                             if args.hebrew:
@@ -141,7 +143,7 @@ if __name__ == '__main__':
                 for _ in range(3):
                     prompt = "בבוקר אחד" if args.hebrew else "JULIET:"
                     input_ids = tokenizer.tokenize(prompt)
-                    generated = model.sample_continuation(input_ids, 500)
+                    generated = model.better_sample_continuation(input_ids, 500, args.temperature, args.topK)
                     generations.append(tokenizer.detokenize(generated))
                 model.train()
                 hyperparams = {
@@ -153,12 +155,15 @@ if __name__ == '__main__':
                     'learning_rate': learning_rate,
                     'mlp_hidden_size': mlp_hidden_size,
                     'num_batches_to_train': num_batches_to_train,
+                    'temperature': args.temperature,
+                    'topK': args.topK,
                 }
                 elapsed = time.time() - start_time
                 hyperparams['timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
                 hyperparams['elapsed_seconds'] = elapsed
                 lang = 'hebrew' if args.hebrew else 'english'
                 print(f"Checkpoint at batch {num_batches}, elapsed {elapsed:.1f} seconds.")
+                print(f"Sampling with temperature={args.temperature}, topK={args.topK}")
                 # Save each checkpoint in its own folder, including language
                 checkpoint_dir = f'checkpoints/{lang}_step_{num_batches}'
                 os.makedirs(checkpoint_dir, exist_ok=True)
@@ -170,7 +175,7 @@ if __name__ == '__main__':
         for i in range(3):
             prompt = "בבוקר אחד" if args.hebrew else "JULIET:"
             input_ids = tokenizer.tokenize(prompt)
-            generated = model.sample_continuation(input_ids, 500)
+            generated = model.better_sample_continuation(input_ids, 500, args.temperature, args.topK)
             detok = tokenizer.detokenize(generated)
             print("Model sample: ", end="")
             if args.hebrew:
